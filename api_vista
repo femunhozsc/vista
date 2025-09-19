@@ -1,0 +1,174 @@
+from flask import Flask, jsonify, request, send_file
+from flask_cors import CORS
+import matplotlib.pyplot as plt
+import csv
+import os
+import pandas as pd
+from datetime import datetime
+import yfinance as yf
+import requests
+from pytz import timezone
+from difflib import get_close_matches
+from dateutil.relativedelta import relativedelta
+import math
+import io
+import base64
+
+app = Flask(__name__)
+CORS(app)
+
+class FinancialAPI:
+    def __init__(self):
+        self.cache = {}
+        self.tickers_map = {}
+        self.nomes_map = {}
+        self.carregar_dados_csv('acoes-listadas-b3.csv')
+        
+        self.traducoes = {
+            'sector': 'Setor', 'industry': 'Indústria', 'longBusinessSummary': 'Descrição',
+            'quoteType': 'Tipo de Ativo', 'market': 'Mercado', 'exchangeName': 'Bolsa',
+            'EQUITY': 'Ação', 'CRYPTOCURRENCY': 'Criptomoeda', 'CURRENCY': 'Moeda',
+            'ETF': 'ETF', 'INDEX': 'Índice', 'MUTUALFUND': 'Fundo'
+        }
+
+    def carregar_dados_csv(self, arquivo_csv):
+        try:
+            with open(arquivo_csv, mode='r', encoding='utf-8') as f:
+                leitor = csv.reader(f)
+                next(leitor)
+                for linha in leitor:
+                    if len(linha) >= 2 and linha[0] and linha[1]:
+                        ticker_sa = f"{linha[0].strip().upper()}.SA"
+                        nome = linha[1].strip().upper()
+                        self.tickers_map[ticker_sa] = nome
+                        if nome not in self.nomes_map: 
+                            self.nomes_map[nome] = []
+                        self.nomes_map[nome].append(ticker_sa)
+        except Exception as e:
+            print(f"Erro ao carregar CSV: {e}")
+
+    def pesquisar_ativo(self, comando):
+        comando_upper = comando.strip().upper()
+        
+        if comando_upper.endswith('.SA') and comando_upper in self.tickers_map:
+            return [comando_upper]
+        if f"{comando_upper}.SA" in self.tickers_map:
+            return [f"{comando_upper}.SA"]
+        if comando_upper in self.tickers_map:
+            return [comando_upper]
+
+        if '/' in comando_upper:
+            partes = comando_upper.split('/')
+            return [f"{partes[0].strip()}{partes[1].strip()}=X"] if len(partes) == 2 else []
+        
+        if comando_upper in self.nomes_map:
+            return self.nomes_map[comando_upper]
+        
+        matches = get_close_matches(comando_upper, self.nomes_map.keys(), n=5, cutoff=0.6)
+        if matches:
+            return list(set(ticker for match in matches for ticker in self.nomes_map[match]))
+        
+        return [f"{comando_upper}.SA", comando_upper]
+
+    def buscar_dados_ativo(self, ticker):
+        if ticker in self.cache:
+            return self.cache[ticker]
+        
+        try:
+            ativo = yf.Ticker(ticker)
+            info = ativo.info
+            hist = ativo.history(period="5y")
+            
+            if not info or info.get('regularMarketPrice') is None:
+                return None
+                
+            dados = {"info": info, "historico": hist}
+            self.cache[ticker] = dados
+            return dados
+        except Exception:
+            return None
+
+    def formatar_valor(self, valor, tipo='numero', moeda='R$'):
+        if valor is None:
+            return "N/D"
+        try:
+            if tipo == 'porcentagem':
+                return f"{valor:,.2f}%"
+            prefixo = f"{moeda} " if tipo == 'moeda' else ""
+            if abs(valor) >= 1e12:
+                return f"{prefixo}{valor / 1e12:,.2f} Tri"
+            if abs(valor) >= 1e9:
+                return f"{prefixo}{valor / 1e9:,.2f} Bi"
+            if abs(valor) >= 1e6:
+                return f"{prefixo}{valor / 1e6:,.2f} Mi"
+            return f"{prefixo}{valor:,.2f}"
+        except (ValueError, TypeError):
+            return "N/D"
+
+    def gerar_grafico_base64(self, ticker, periodo, dados_historicos):
+        if dados_historicos.empty:
+            return None
+            
+        periodos = {
+            '5d': pd.Timedelta(days=5),
+            '1m': pd.Timedelta(days=30),
+            '6m': pd.Timedelta(days=180),
+            '1y': pd.Timedelta(days=365),
+            '5y': pd.Timedelta(days=5*365)
+        }
+        
+        if periodo != 'max':
+            dados_periodo = dados_historicos.last(periodos[periodo])
+        else:
+            dados_periodo = dados_historicos
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(dados_periodo.index, dados_periodo['Close'])
+        plt.title(f'Preço - {ticker} ({periodo})')
+        plt.ylabel('Preço (R$)')
+        plt.grid(True)
+        
+        img = io.BytesIO()
+        plt.savefig(img, format='png')
+        img.seek(0)
+        plt.close()
+        
+        return base64.b64encode(img.getvalue()).decode('utf-8')
+
+financial_api = FinancialAPI()
+
+@app.route('/api/pesquisar/<string:nome>')
+def pesquisar(nome):
+    resultados = financial_api.pesquisar_ativo(nome)
+    return jsonify(resultados)
+
+@app.route('/api/dados/<string:ticker>')
+def dados_ativos(ticker):
+    dados = financial_api.buscar_dados_ativo(ticker)
+    if not dados:
+        return jsonify({"erro": "Ativo não encontrado"}), 404
+    
+    return jsonify(dados)
+
+@app.route('/api/grafico/<string:ticker>')
+def gerar_grafico(ticker):
+    periodo = request.args.get('periodo', '1y')
+    dados = financial_api.buscar_dados_ativo(ticker)
+    
+    if not dados:
+        return jsonify({"erro": "Ativo não encontrado"}), 404
+        
+    img_base64 = financial_api.gerar_grafico_base64(ticker, periodo, dados['historico'])
+    
+    if not img_base64:
+        return jsonify({"erro": "Erro ao gerar gráfico"}), 500
+        
+    return jsonify({"imagem": f"data:image/png;base64,{img_base64}"})
+
+@app.route('/api/comparar/<string:ticker1>/<string:ticker2>')
+def comparar_ativos(ticker1, ticker2):
+    # Implementação similar para gráfico comparativo
+    pass
+
+if __name__ == '__main__':
+    app.run(debug=True)
